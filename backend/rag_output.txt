@@ -1,0 +1,5 @@
+--- RAG Test Started at 2026-02-16T20:16:07.245Z ---
+🔌 Connecting to DB...
+Connecting to: cluster0.tjgaryr.mongodb.net/verdix?retryWrites=true&w=majority&tls=true&tlsAllowInvalidCertificates=true
+❌ Error: 40D8879EFD6F0000:error:0A000438:SSL routines:ssl3_read_bytes:tlsv1 alert internal error:../deps/openssl/openssl/ssl/record/rec_layer_s3.c:1605:SSL alert number 80
+
