@@ -167,3 +167,17 @@ SaaS subscription:
 
 ```bash
 git clone https://github.com/your-username/verdix.git
+```
+## Run Backend
+```
+cd backend
+npm install
+npm run dev
+```
+## Run Frontend
+```
+cd frontend
+npm install
+npm start
+```
+
