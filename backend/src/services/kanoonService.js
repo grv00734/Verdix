@@ -1,558 +1,491 @@
 const axios = require('axios');
+const cheerio = require('cheerio');
 const CasePrecedent = require('../models/CasePrecedent');
 
 /**
- * Service for Official Indian Kanoon API Integration
- * 
- * Official API Documentation: https://api.indiankanoon.org
- * This service uses the official Indian Kanoon API with Token-based authentication.
- * 
- * Benefits of Official API:
- * - Proper API endpoints vs web scraping
- * - JSON/XML structured responses
- * - Official support and reliability
- * - Token-based authentication
- * - Pagination support
- * - Advanced filtering (doctypes, dates, authors, etc.)
+ * Indian Kanoon Crawler
+ * -----------------------------------------------------------------------------
+ * Extracts judgments and statute text directly from the public Indian Kanoon
+ * website (https://indiankanoon.org) using polite HTML crawling instead of the
+ * paid token-based API.
+ *
+ * Design goals (production / "industrial" grade):
+ *   - Polite by default: enforced minimum delay between every HTTP request,
+ *     a descriptive User-Agent, and bounded concurrency (sequential fetches).
+ *   - Resilient: retries with exponential backoff on transient/HTTP 429/5xx,
+ *     multiple fallback selectors so a minor markup change does not break us.
+ *   - Self-contained: no API key required. Configuration is via env vars with
+ *     sensible defaults (see backend/.env.example).
+ *
+ * NOTE ON RESPONSIBLE USE: Crawl gently. Keep KANOON_CRAWL_DELAY_MS high enough
+ * to avoid load on the source, respect their terms of use, and cache results in
+ * MongoDB so each document is only fetched once.
  */
 
-const KANOON_API_BASE_URL = 'https://api.indiankanoon.org';
+const BASE_URL = 'https://indiankanoon.org';
 
-class KanoonService {
+class KanoonCrawler {
   constructor() {
-    this.apiToken = process.env.KANOON_API_TOKEN;
-    this.rateLimitDelay = 1000; // API best practice: 1 second between requests
-    this.maxRetries = 3;
-    this.timeout = 30000;
-    this.acceptHeader = 'application/json'; // Request JSON format
+    this.baseUrl = BASE_URL;
+    this.rateLimitDelay = Number(process.env.KANOON_CRAWL_DELAY_MS || 2500);
+    this.maxRetries = Number(process.env.KANOON_MAX_RETRIES || 3);
+    this.timeout = Number(process.env.KANOON_TIMEOUT_MS || 30000);
+    this.userAgent =
+      process.env.KANOON_USER_AGENT ||
+      'Mozilla/5.0 (compatible; VerdixLegalBot/1.0; +https://verdix.example/about/bot)';
+    this._lastRequestAt = 0;
+  }
+
+  /* --------------------------------------------------------------------- */
+  /*  Low-level HTTP                                                        */
+  /* --------------------------------------------------------------------- */
+
+  /**
+   * Sleep helper.
+   * @private
+   */
+  _sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   /**
-   * Verify API token is configured
+   * Enforce a minimum gap between outbound requests so we never hammer the
+   * source site, regardless of how callers schedule work.
+   * @private
    */
-  validateConfiguration() {
-    if (!this.apiToken) {
-      throw new Error([
-        'KANOON_API_TOKEN not configured!',
-        '',
-        'Get your API token from: https://indiankanoon.org',
-        'Steps:',
-        '1. Visit https://indiankanoon.org/login/',
-        '2. Login or create account',
-        '3. Go to API settings/profile',
-        '4. Generate and copy your API token',
-        '5. Add to .env: KANOON_API_TOKEN=your_token_here',
-        '',
-        'Documentation: https://api.indiankanoon.org'
-      ].join('\n'));
+  async _throttle() {
+    const elapsed = Date.now() - this._lastRequestAt;
+    if (elapsed < this.rateLimitDelay) {
+      await this._sleep(this.rateLimitDelay - elapsed);
     }
+    this._lastRequestAt = Date.now();
   }
 
   /**
-   * Get authorization headers with API token
+   * Perform a throttled GET with retry + exponential backoff.
+   * Returns the raw HTML string.
+   * @private
    */
-  getAuthHeaders() {
-    return {
-      'Authorization': `Token ${this.apiToken}`,
-      'Accept': this.acceptHeader,
-      'User-Agent': 'Verdix-Legal-Platform/1.0'
-    };
+  async _get(url, { params } = {}) {
+    let lastError;
+
+    for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
+      await this._throttle();
+
+      try {
+        const response = await axios.get(url, {
+          params,
+          timeout: this.timeout,
+          // Treat 4xx as resolved so we can inspect status without throwing.
+          validateStatus: (s) => s < 500,
+          headers: {
+            'User-Agent': this.userAgent,
+            Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            Referer: `${this.baseUrl}/`
+          }
+        });
+
+        if (response.status === 200) {
+          return response.data;
+        }
+
+        if (response.status === 404) {
+          throw new Error(`Document not found (HTTP 404): ${url}`);
+        }
+
+        // 429 / 403 / other 4xx -> back off and retry; the site may be
+        // rate-limiting us or temporarily blocking the crawler.
+        lastError = new Error(`Kanoon returned HTTP ${response.status} for ${url}`);
+      } catch (error) {
+        if (error.message && error.message.includes('HTTP 404')) {
+          throw error; // not retryable
+        }
+        // Network / timeout / 5xx — retryable.
+        lastError = error;
+      }
+
+      if (attempt < this.maxRetries) {
+        const backoff = this.rateLimitDelay * Math.pow(2, attempt - 1);
+        console.warn(
+          `[Kanoon Crawler] Attempt ${attempt}/${this.maxRetries} failed for ${url} — retrying in ${backoff}ms (${lastError.message})`
+        );
+        await this._sleep(backoff);
+      }
+    }
+
+    throw new Error(`Failed to fetch ${url} after ${this.maxRetries} attempts: ${lastError.message}`);
   }
 
+  /* --------------------------------------------------------------------- */
+  /*  Search                                                               */
+  /* --------------------------------------------------------------------- */
+
   /**
-   * Search for cases using official Kanoon API
-   * 
-   * @param {string} query - Search query (e.g., "murder OR rape", "Section 302 IPC")
-   * @param {Object} options - Additional options
-   * @param {number} options.pagenum - Page number (starts at 0)
-   * @param {number} options.maxpages - Max pages to fetch
-   * @param {string} options.doctypes - Filter by court types (supremecourt, bombay, delhi, etc.)
-   * @param {string} options.fromdate - Filter from date (DD-MM-YYYY)
-   * @param {string} options.todate - Filter to date (DD-MM-YYYY)
-   * @param {string} options.title - Search in title only
-   * @param {string} options.cite - Filter by citation
-   * @param {string} options.author - Filter by judge author
-   * @param {number} options.maxcites - Max citations to include (1-50)
-   * @returns {Promise<Object>} Search results
+   * Crawl the Indian Kanoon search results page for a query.
+   *
+   * @param {string} query - free-text query, e.g. "Section 302 IPC murder"
+   * @param {Object} [options]
+   * @param {number} [options.pagenum=0]   - results page (0-indexed)
+   * @param {string} [options.doctypes]    - court filter (e.g. "supremecourt")
+   * @param {string} [options.fromdate]    - DD-MM-YYYY
+   * @param {string} [options.todate]      - DD-MM-YYYY
+   * @returns {Promise<{success:boolean, query:string, found:number, docs:Array}>}
    */
   async searchCases(query, options = {}) {
-    try {
-      this.validateConfiguration();
+    if (!query || !query.trim()) {
+      throw new Error('searchCases requires a non-empty query string');
+    }
 
-      const pagenum = options.pagenum || 0;
-      const maxpages = options.maxpages || 1;
+    const params = { formInput: query, pagenum: options.pagenum || 0 };
+    if (options.doctypes) params.doctypes = options.doctypes;
+    if (options.fromdate) params.fromdate = options.fromdate;
+    if (options.todate) params.todate = options.todate;
 
-      console.log(`[Kanoon API] Searching for: "${query}" (page ${pagenum})`);
+    console.log(`[Kanoon Crawler] Searching: "${query}" (page ${params.pagenum})`);
+    const html = await this._get(`${this.baseUrl}/search/`, { params });
+    const result = this._parseSearchResults(html, query);
+    console.log(`[Kanoon Crawler] Parsed ${result.docs.length} results (≈${result.found} total)`);
+    return result;
+  }
 
-      // Build query parameters
-      const params = {
-        formInput: query,
-        pagenum: pagenum,
-        maxpages: maxpages
-      };
+  /**
+   * Parse a search-results HTML page into structured doc summaries.
+   * @private
+   */
+  _parseSearchResults(html, query) {
+    const $ = cheerio.load(html);
+    const docs = [];
 
-      // Add optional filters
-      if (options.doctypes) params.doctypes = options.doctypes;
-      if (options.fromdate) params.fromdate = options.fromdate;
-      if (options.todate) params.todate = options.todate;
-      if (options.title) params.title = options.title;
-      if (options.cite) params.cite = options.cite;
-      if (options.author) params.author = options.author;
-      if (options.maxcites) params.maxcites = Math.min(options.maxcites, 50);
+    $('.result').each((_, el) => {
+      const $el = $(el);
+      const link = $el.find('.result_title a').first();
+      const href = link.attr('href') || '';
+      const tid = this._extractDocId(href);
+      if (!tid) return;
 
-      // Call official API endpoint (Kanoon API requires POST with form data)
-      const url = `${KANOON_API_BASE_URL}/search/`;
-      const formData = new URLSearchParams(params).toString();
-      const response = await axios.post(url, formData, {
-        headers: {
-          ...this.getAuthHeaders(),
-          'Content-Type': 'application/x-www-form-urlencoded'
-        },
-        timeout: this.timeout
+      docs.push({
+        tid,
+        title: this._clean(link.text()) || 'Untitled',
+        docsource: this._clean($el.find('.docsource').first().text()) || 'Unknown Court',
+        headline: this._clean($el.find('.headline').first().text()),
+        url: `${this.baseUrl}/doc/${tid}/`,
+        doctype: 'judgment'
       });
+    });
 
-      if (response.status === 200 && response.data) {
-        const searchResults = {
-          success: true,
-          query: query,
-          found: response.data.found || 0,
-          pagenum: response.data.pagenum || 0,
-          docs: this._parseSearchDocs(response.data.docs || []),
-          categories: response.data.categories || [],
-          totalDocuments: response.data.found || 0
-        };
+    // Best-effort total count, e.g. "1 - 10 of 12345"
+    let found = docs.length;
+    const countMatch = $('body').text().match(/of\s+([\d,]+)\b/);
+    if (countMatch) found = parseInt(countMatch[1].replace(/,/g, ''), 10) || docs.length;
 
-        console.log(`[Kanoon API] Found ${searchResults.found} results`);
-        return searchResults;
-      }
+    return { success: true, query, found, pagenum: 0, docs };
+  }
 
-      throw new Error('Invalid response from Kanoon API');
-    } catch (error) {
-      console.error(`[Kanoon API] Search error:`, error.message);
+  /* --------------------------------------------------------------------- */
+  /*  Document detail                                                      */
+  /* --------------------------------------------------------------------- */
 
-      if (error.response?.status === 403) {
-        throw new Error('Kanoon API: Authentication failed. Check your API token.');
-      }
+  /**
+   * Crawl a single document page and parse it into a CasePrecedent-shaped object.
+   *
+   * @param {string|number} docidOrUrl - numeric id or full /doc/<id>/ URL
+   * @returns {Promise<Object>} structured case data
+   */
+  async fetchCaseDetails(docidOrUrl) {
+    const docid = this._extractDocId(docidOrUrl);
+    if (!docid) throw new Error(`Could not resolve a document id from: ${docidOrUrl}`);
 
-      throw new Error(`Failed to search Kanoon API: ${error.message}`);
-    }
+    const url = `${this.baseUrl}/doc/${docid}/`;
+    console.log(`[Kanoon Crawler] Fetching document ${docid}`);
+    const html = await this._get(url);
+    const caseData = this._parseDocPage(html, docid);
+    console.log(`[Kanoon Crawler] ✓ Parsed: ${caseData.title.substring(0, 60)}`);
+    return caseData;
   }
 
   /**
-   * Parse search documents from API response
+   * Parse a /doc/<id>/ page into structured fields.
    * @private
    */
-  _parseSearchDocs(docs) {
-    return docs.map(doc => ({
-      tid: doc.tid || doc.id,
-      title: doc.title || 'Unknown',
-      docsource: doc.docsource || doc.court || 'Unknown Court',
-      headline: doc.headline || doc.snippet || '',
-      docsize: doc.docsize || 0,
-      date: doc.date || null,
-      casetype: doc.casetype || 'Unknown',
-      doctype: doc.doctype || 'judgment'
-    }));
-  }
+  _parseDocPage(html, docid) {
+    const $ = cheerio.load(html);
+    // Strip non-content chrome (nav, ads, cite toolbar, premium banners,
+    // the document-analysis sidebar) before extracting the judgment text.
+    $(
+      'script, style, noscript, header, footer, nav, aside, ' +
+      '.ad_doc, .doc_ads, .premium-banner, .left_column, .sticky_column, ' +
+      '.covers, .covertop, .citetop, .header-nav, .nav-desktop'
+    ).remove();
 
-  /**
-   * Fetch detailed case information using official API
-   * 
-   * @param {string} docid - Document ID (can be numeric ID or case URL)
-   * @param {Object} options - Additional options
-   * @param {number} options.maxcites - Max citations to fetch (1-50)
-   * @param {number} options.maxcitedby - Max cited-by documents (1-50)
-   * @returns {Promise<Object>} Detailed case data
-   */
-  async fetchCaseDetails(docid, options = {}) {
-    try {
-      this.validateConfiguration();
+    const title =
+      this._clean($('.doc_title').first().text()) ||
+      this._clean($('h1, h2').first().text()) ||
+      `Indian Kanoon Document ${docid}`;
 
-      // Extract numeric ID if URL is provided
-      const numericId = this._extractDocId(docid);
-      console.log(`[Kanoon API] Fetching case details: ${numericId}`);
+    const court =
+      this._clean($('.docsource_main').first().text()) ||
+      this._clean($('.docsource').first().text()) ||
+      'Unknown Court';
 
-      // Build parameters
-      const params = {};
-      if (options.maxcites) params.maxcites = Math.min(options.maxcites, 50);
-      if (options.maxcitedby) params.maxcitedby = Math.min(options.maxcitedby, 50);
+    const bench =
+      this._clean($('.doc_bench').first().text()) ||
+      this._clean($('.doc_author').first().text());
 
-      // Call official API endpoint (Kanoon API requires POST)
-      const url = `${KANOON_API_BASE_URL}/doc/${numericId}/`;
-      const formData = new URLSearchParams(params).toString();
-      const response = await axios.post(url, formData, {
-        headers: {
-          ...this.getAuthHeaders(),
-          'Content-Type': 'application/x-www-form-urlencoded'
-        },
-        timeout: this.timeout
-      });
+    // Primary content container, with progressive fallbacks.
+    let body = this._clean($('.maindoc').text());
+    if (!body || body.length < 40) body = this._clean($('.judgments').text());
+    if (!body || body.length < 40) body = this._clean($('pre').text());
+    if (!body || body.length < 40) body = this._clean($('#main_content, .doc_content').text());
 
-      if (response.status === 200 && response.data) {
-        const caseData = this._parseCaseResponse(response.data);
-        console.log(`[Kanoon API] ✓ Fetched: ${caseData.title}`);
-        return caseData;
-      }
+    const ipcSections = this._extractIPCSections(`${title} ${body}`);
+    const keywords = this._extractKeywords(`${title} ${body}`, court);
 
-      throw new Error('Invalid response from Kanoon API');
-    } catch (error) {
-      console.error(`[Kanoon API] Fetch error:`, error.message);
-
-      if (error.response?.status === 403) {
-        throw new Error('Kanoon API: Authentication failed. Check your API token.');
-      }
-      if (error.response?.status === 404) {
-        throw new Error(`Kanoon API: Document not found: ${docid}`);
-      }
-
-      throw error;
-    }
-  }
-
-  /**
-   * Extract numeric document ID from URL or return as-is
-   * @private
-   */
-  _extractDocId(docidOrUrl) {
-    if (!docidOrUrl) return null;
-
-    // If it's already numeric, return as-is
-    if (/^\d+$/.test(docidOrUrl.toString())) {
-      return docidOrUrl;
-    }
-
-    // Try to extract from URL: /doc/12345/
-    const match = docidOrUrl.match(/\/doc\/(\d+)\//);
-    return match ? match[1] : docidOrUrl;
-  }
-
-  /**
-   * Parse official API response into structured case data
-   * @private
-   */
-  _parseCaseResponse(data) {
     return {
-      // Source info
-      kanoonUrl: `https://indiankanoon.org/doc/${data.id}/`,
-      source: 'IndianKanoon-Official-API',
-      sourceId: data.id?.toString(),
+      // Source / identity
+      kanoonUrl: `${this.baseUrl}/doc/${docid}/`,
+      source: 'IndianKanoon',
+      sourceId: docid.toString(),
+      caseNumber: `IK-${docid}`,
 
-      // Document info
-      docid: data.id,
-      title: data.title || 'Unknown Case',
-      caseNumber: data.caseid || data.caseNumber || 'N/A',
-      year: this._extractYear(data),
-      court: data.court_name || data.court || 'Unknown Court',
-      doctype: data.doctype || 'judgment',
-
-      // Parties & judges
-      judges: this._extractJudges(data),
-      parties: this._extractParties(data),
+      // Bibliographic
+      title,
+      year: this._extractYear(title, body),
+      court,
+      doctype: 'judgment',
+      judges: bench ? bench.split(/,|and/i).map((j) => this._clean(j)).filter(Boolean) : [],
 
       // Legal content
-      ipcSections: this._extractIPCSections(data),
-      keywords: this._extractKeywords(data),
-      acts: data.acts || [], // Statutory references
+      ipcSections,
+      keywords,
+      facts: body.substring(0, 2000),
+      decision: body,
+      summary: this._buildSummary(body),
+      verdict: this._inferVerdict(body),
 
-      // Case content
-      facts: data.facts || '',
-      decision: data.judgment || data.decision || '',
-      summary: data.summary || data.judgment?.substring(0, 500) || '',
-      headnotes: data.headnotes || [],
-
-      // Citations
-      cites: data.citeList || [],
-      citedBy: data.citedbyList || [],
-
-      // Metadata
-      date: data.date || data.judgement_date || null,
-      bench: data.bench_name || null,
-      ruling: data.ruling || null,
-
-      // API metadata
       fetchedAt: new Date()
     };
   }
 
-  /**
-   * Extract year from various possible date formats
-   * @private
-   */
-  _extractYear(data) {
-    if (data.year) return parseInt(data.year);
-    if (data.date) {
-      const match = data.date.match(/(\d{4})/);
-      return match ? parseInt(match[1]) : new Date().getFullYear();
-    }
-    if (data.caseid) {
-      const match = data.caseid.match(/(\d{4})/);
-      return match ? parseInt(match[1]) : new Date().getFullYear();
-    }
-    return new Date().getFullYear();
-  }
+  /* --------------------------------------------------------------------- */
+  /*  Bulk crawl + persistence                                             */
+  /* --------------------------------------------------------------------- */
 
   /**
-   * Extract judges from API response
-   * @private
-   */
-  _extractJudges(data) {
-    if (data.judges && Array.isArray(data.judges)) {
-      return data.judges.map(j => j.name || j).filter(Boolean);
-    }
-    if (data.judge_name) {
-      return [data.judge_name];
-    }
-    if (data.bench_name) {
-      return [data.bench_name];
-    }
-    return [];
-  }
-
-  /**
-   * Extract party names
-   * @private
-   */
-  _extractParties(data) {
-    const parties = { plaintiff: null, defendant: null };
-
-    if (data.parties && Array.isArray(data.parties) && data.parties.length >= 2) {
-      parties.plaintiff = data.parties[0].name || data.parties[0];
-      parties.defendant = data.parties[1].name || data.parties[1];
-    } else if (data.appellant) {
-      parties.plaintiff = data.appellant;
-      parties.defendant = data.respondent || data.appellee;
-    }
-
-    return parties;
-  }
-
-  /**
-   * Extract IPC sections from document
-   * @private
-   */
-  _extractIPCSections(data) {
-    const sections = new Set();
-
-    // Method 1: Direct IPC sections array
-    if (data.ipc_sections && Array.isArray(data.ipc_sections)) {
-      data.ipc_sections.forEach(s => {
-        if (typeof s === 'string') {
-          sections.add(s);
-        } else if (s.section) {
-          sections.add(s.section);
-        }
-      });
-    }
-
-    // Method 2: Parse from text content
-    const textToSearch = [
-      data.title || '',
-      data.judgment || '',
-      data.facts || '',
-      data.summary || ''
-    ].join(' ');
-
-    // Match patterns like "Section 302", "S. 307", "IPC 420"
-    const patterns = [
-      /Section\s+(\d+[A-Z]?)\s+(?:IPC|I\.P\.C|of the IPC)/gi,
-      /S\.\s+(\d+[A-Z]?)\s+(?:IPC|I\.P\.C)/gi,
-      /IPC\s+Section\s+(\d+[A-Z]?)/gi,
-      /Article\s+(\d+)/gi
-    ];
-
-    for (const pattern of patterns) {
-      let match;
-      while ((match = pattern.exec(textToSearch)) && sections.size < 20) {
-        sections.add(match[1].toString());
-      }
-    }
-
-    return Array.from(sections).slice(0, 15);
-  }
-
-  /**
-   * Extract keywords
-   * @private
-   */
-  _extractKeywords(data) {
-    const keywords = new Set();
-
-    // Add IPC sections as keywords
-    const ipcSections = this._extractIPCSections(data);
-    ipcSections.forEach(s => keywords.add(`IPC-${s}`));
-
-    // Add case type if available
-    if (data.casetype) keywords.add(data.casetype);
-    if (data.court) keywords.add(data.court);
-
-    // Add from subject matter
-    const commonTerms = ['murder', 'theft', 'rape', 'fraud', 'property', 'inheritance', 'divorce', 'custody', 'contract', 'negligence', 'cruelty', 'defamation', 'harassment'];
-    const contentText = [data.title || '', data.summary || ''].join(' ').toLowerCase();
-
-    commonTerms.forEach(term => {
-      if (contentText.includes(term)) {
-        keywords.add(term);
-      }
-    });
-
-    return Array.from(keywords).slice(0, 15);
-  }
-
-  /**
-   * Fetch and index cases from Kanoon API
-   * Uses official API to search and fetch cases in bulk
+   * Search each query, crawl the top `limit` documents, and persist them.
+   *
+   * @param {string[]} queries
+   * @param {number}   [limit=5]  - docs to fetch per query
+   * @param {Object}   [options]  - forwarded to searchCases
+   * @returns {Promise<Object>} summary with stats, saved cases, and errors
    */
   async fetchAndIndexCases(queries, limit = 5, options = {}) {
-    const indexedCases = [];
+    const savedCases = [];
     const failedCases = [];
     const stats = {
       searchedQueries: 0,
       casesFound: 0,
       casesFetched: 0,
-      casesIndexed: 0,
+      casesSaved: 0,
       errors: 0
     };
 
     for (const query of queries) {
       try {
-        console.log(`\n[Kanoon Sync] Processing query: "${query}"`);
         stats.searchedQueries++;
-
-        // Search for cases
-        const searchResults = await this.searchCases(query, {
-          pagenum: 0,
-          maxpages: 1
-        });
-
-        if (!searchResults.docs || searchResults.docs.length === 0) {
-          console.log(`[Kanoon Sync] ⚠ No results for query: "${query}"`);
+        const { docs } = await this.searchCases(query, options);
+        if (!docs.length) {
+          console.log(`[Kanoon Crawler] No results for "${query}"`);
           continue;
         }
+        stats.casesFound += docs.length;
 
-        stats.casesFound += searchResults.docs.length;
-
-        // Fetch each document (limit to specified amount)
-        for (let i = 0; i < Math.min(searchResults.docs.length, limit); i++) {
-          const doc = searchResults.docs[i];
-
+        for (const doc of docs.slice(0, limit)) {
           try {
-            // Add rate limiting delay
-            await new Promise(resolve => setTimeout(resolve, this.rateLimitDelay));
-
-            // Fetch full document
-            const caseData = await this.fetchCaseDetails(doc.tid, {
-              maxcites: 5,
-              maxcitedby: 5
-            });
-
+            const caseData = await this.fetchCaseDetails(doc.tid);
             stats.casesFetched++;
-
-            // Save to database
-            const savedCase = await this._saveCaseToDatabase(caseData);
-            indexedCases.push(savedCase);
-            stats.casesIndexed++;
-
-            console.log(`  ✓ Indexed: ${caseData.title.substring(0, 50)}...`);
+            const saved = await this._saveCaseToDatabase(caseData);
+            savedCases.push(saved);
+            stats.casesSaved++;
           } catch (error) {
-            console.error(`  ✗ Failed to fetch document ${doc.tid}:`, error.message);
-            failedCases.push({
-              query: query,
-              docid: doc.tid,
-              title: doc.title,
-              error: error.message
-            });
+            console.error(`[Kanoon Crawler] ✗ doc ${doc.tid}: ${error.message}`);
+            failedCases.push({ query, docid: doc.tid, title: doc.title, error: error.message });
             stats.errors++;
           }
         }
       } catch (error) {
-        console.error(`[Kanoon Sync] ✗ Failed for query "${query}":`, error.message);
-        failedCases.push({
-          query: query,
-          error: error.message
-        });
+        console.error(`[Kanoon Crawler] ✗ query "${query}": ${error.message}`);
+        failedCases.push({ query, error: error.message });
         stats.errors++;
       }
     }
 
     return {
-      success: indexedCases.length > 0,
-      stats: stats,
-      indexed: indexedCases.length,
+      success: savedCases.length > 0,
+      stats,
+      indexed: savedCases.length,
       failed: failedCases.length,
-      cases: indexedCases,
+      cases: savedCases,
       errors: failedCases
     };
   }
 
   /**
-   * Save case data to MongoDB
+   * Upsert a crawled case into MongoDB, de-duplicating on source id / URL.
    * @private
    */
   async _saveCaseToDatabase(caseData) {
-    try {
-      // Check if case already exists
-      const existingCase = await CasePrecedent.findOne({
-        $or: [
-          { sourceId: caseData.sourceId },
-          { kanoonUrl: caseData.kanoonUrl }
-        ]
-      });
+    const existing = await CasePrecedent.findOne({
+      $or: [{ sourceId: caseData.sourceId }, { kanoonUrl: caseData.kanoonUrl }]
+    });
 
-      if (existingCase) {
-        console.log(`    [Already indexed: ${caseData.caseNumber}]`);
-        return existingCase;
-      }
-
-      // Create new case record
-      const newCase = new CasePrecedent({
-        ...caseData,
-        year: caseData.year || new Date().getFullYear()
-      });
-
-      const savedCase = await newCase.save();
-      console.log(`    [Saved to DB]`);
-      return savedCase;
-    } catch (error) {
-      console.error('Error saving case to database:', error.message);
-      throw error;
+    if (existing) {
+      console.log(`[Kanoon Crawler]   already stored: ${caseData.caseNumber}`);
+      return existing;
     }
+
+    const created = await CasePrecedent.create({
+      ...caseData,
+      year: caseData.year || new Date().getFullYear()
+    });
+    console.log(`[Kanoon Crawler]   saved: ${caseData.caseNumber}`);
+    return created;
+  }
+
+  /* --------------------------------------------------------------------- */
+  /*  Parsing helpers                                                      */
+  /* --------------------------------------------------------------------- */
+
+  /**
+   * Collapse whitespace and trim. Returns '' for nullish input.
+   * @private
+   */
+  _clean(text) {
+    if (!text) return '';
+    return text.replace(/\s+/g, ' ').trim();
   }
 
   /**
-   * Get recommended search queries based on popular IPC sections
+   * Extract a numeric Indian Kanoon document id from an id or any URL form.
+   * @private
+   */
+  _extractDocId(input) {
+    if (input === null || input === undefined) return null;
+    const str = input.toString();
+    if (/^\d+$/.test(str)) return str;
+    const match = str.match(/\/docfragment\/(\d+)|\/doc\/(\d+)/);
+    if (match) return match[1] || match[2];
+    const digits = str.match(/(\d{3,})/);
+    return digits ? digits[1] : null;
+  }
+
+  /**
+   * Pull IPC sections / constitutional articles out of free text.
+   * @private
+   */
+  _extractIPCSections(text) {
+    const sections = new Set();
+    const patterns = [
+      /Section\s+(\d+[A-Z]?)\s+(?:IPC|I\.P\.C|of the IPC|in the Indian Penal Code)/gi,
+      /S\.?\s*(\d+[A-Z]?)\s+(?:IPC|I\.P\.C)/gi,
+      /IPC\s+Section\s+(\d+[A-Z]?)/gi,
+      /Article\s+(\d+[A-Z]?)/gi
+    ];
+    for (const pattern of patterns) {
+      let m;
+      while ((m = pattern.exec(text)) && sections.size < 20) {
+        sections.add(m[1].toUpperCase());
+      }
+    }
+    return Array.from(sections).slice(0, 15);
+  }
+
+  /**
+   * Derive lightweight keyword tags for filtering/search.
+   * @private
+   */
+  _extractKeywords(text, court) {
+    const keywords = new Set();
+    this._extractIPCSections(text).forEach((s) => keywords.add(`IPC-${s}`));
+    if (court && court !== 'Unknown Court') keywords.add(court);
+
+    const terms = [
+      'murder', 'theft', 'rape', 'fraud', 'property', 'inheritance', 'divorce',
+      'custody', 'contract', 'negligence', 'cruelty', 'defamation', 'harassment',
+      'bail', 'dowry', 'cheating', 'forgery', 'conspiracy', 'cybercrime'
+    ];
+    const lower = text.toLowerCase();
+    terms.forEach((t) => lower.includes(t) && keywords.add(t));
+    return Array.from(keywords).slice(0, 15);
+  }
+
+  /**
+   * Find a 4-digit year, preferring the title (which usually ends "... on <date>").
+   * @private
+   */
+  _extractYear(title, body) {
+    const fromTitle = (title || '').match(/\b(19|20)\d{2}\b/);
+    if (fromTitle) return parseInt(fromTitle[0], 10);
+    const fromBody = (body || '').match(/\b(19|20)\d{2}\b/);
+    if (fromBody) return parseInt(fromBody[0], 10);
+    return new Date().getFullYear();
+  }
+
+  /**
+   * First ~3 sentences / 500 chars of the body, as a quick summary.
+   * @private
+   */
+  _buildSummary(body) {
+    if (!body) return '';
+    const sentences = body.split(/(?<=\.)\s+/).slice(0, 3).join(' ');
+    return (sentences || body).substring(0, 500);
+  }
+
+  /**
+   * Heuristically classify the verdict from judgment text.
+   * @private
+   */
+  _inferVerdict(body) {
+    const t = (body || '').toLowerCase();
+    if (/\bacquit/.test(t)) return 'acquitted';
+    if (/\bconvict|found guilty\b/.test(t)) return 'guilty';
+    if (/\bnot guilty\b/.test(t)) return 'not_guilty';
+    if (/\bdismiss/.test(t)) return 'dismissed';
+    if (/\bpartly allowed|partly\b/.test(t)) return 'partial';
+    return 'unknown';
+  }
+
+  /* --------------------------------------------------------------------- */
+  /*  Static helpers                                                       */
+  /* --------------------------------------------------------------------- */
+
+  /**
+   * Recommended seed queries for initial database population.
    */
   static getPopularQueries() {
     return [
-      // Criminal law - High frequency
-      'Section 302 IPC',
-      'Section 307 IPC',
+      'Section 302 IPC murder',
+      'Section 307 IPC attempt to murder',
       'Section 376 IPC',
-      'Section 498A IPC',
-      'Section 420 IPC',
-      'Section 379 IPC',
-      'Section 304B IPC',
-      'Section 506 IPC',
-      'Section 294 IPC',
-      'Section 377 IPC',
-
-      // Civil/Family law
-      'divorce',
-      'custody children',
-      'inheritance property',
-      'contract disputes',
-      'property disputes',
-
-      // Special topics
+      'Section 498A IPC cruelty',
+      'Section 420 IPC cheating',
+      'Section 379 IPC theft',
+      'Section 304B IPC dowry death',
+      'Section 506 IPC criminal intimidation',
+      'divorce mutual consent',
+      'child custody',
+      'inheritance property dispute',
+      'breach of contract',
+      'property partition suit',
       'domestic violence',
-      'dowry system',
-      'harassment stalking',
-      'cybercrime',
-      'defamation case',
-      'criminal intimidation',
-      'death by negligence',
-      'mischief by fire'
+      'cheque bounce 138 NI Act',
+      'cybercrime IT Act',
+      'defamation',
+      'anticipatory bail',
+      'consumer protection deficiency in service',
+      'negligence death'
     ];
   }
 }
 
-module.exports = new KanoonService();
+module.exports = new KanoonCrawler();

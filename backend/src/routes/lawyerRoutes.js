@@ -12,9 +12,11 @@ const { authMiddleware, requireLawyer } = require('../middleware/auth');
 
 router.post('/register', authMiddleware, requireLawyer, registerLawyer);
 router.put('/profile', authMiddleware, requireLawyer, updateLawyerProfile);
-router.get('/:lawyerId', getLawyerProfile);
+// Static paths must be registered before the `/:lawyerId` param route,
+// otherwise "/search" and "/" get captured as a lawyerId.
 router.get('/search', searchLawyers);
 router.get('/', getAllLawyers);
+router.get('/:lawyerId', getLawyerProfile);
 router.put('/:lawyerId/verify', verifyLawyer); // Admin only
 
 module.exports = router;

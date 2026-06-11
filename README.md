@@ -168,16 +168,55 @@ SaaS subscription:
 ```bash
 git clone https://github.com/your-username/verdix.git
 ```
-## Run Backend
-```
+### 8.2 Run Backend
+
+```bash
 cd backend
+cp .env.example .env      # then fill in MONGODB_URI, JWT_SECRET, XAI_API_KEY
 npm install
-npm run dev
+npm run dev               # starts on PORT (default 5001)
 ```
-## Run Frontend
-```
+
+### 8.3 Run Frontend
+
+```bash
 cd frontend
 npm install
-npm start
+npm start                 # starts on http://localhost:3000
 ```
+
+The frontend talks to the backend at `REACT_APP_API_URL` (defaults to
+`http://localhost:5001/api`).
+
+---
+
+## 9. Precedent Data — Indian Kanoon Crawler
+
+Verdix populates its precedent database by **crawling the public Indian Kanoon
+website** (no paid API key required). The crawler is polite by default:
+configurable request delay, exponential-backoff retries, and de-duplicated
+storage in MongoDB.
+
+### 9.1 Populate the database (CLI)
+
+```bash
+cd backend
+npm run crawl                                  # crawl the default seed queries
+npm run crawl -- --limit 8 "Section 302 IPC"   # custom query / docs-per-query
+npm run crawl -- --no-embed "bail" "dowry"     # skip vector embeddings
+```
+
+### 9.2 Crawl via API
+
+| Method | Endpoint                          | Description                                  |
+| ------ | --------------------------------- | -------------------------------------------- |
+| `POST` | `/api/kanoon/search`              | Live search (returns results, no storage)    |
+| `POST` | `/api/kanoon/sync`                | Crawl + store + embed (`{ queries, limit }`) |
+| `POST` | `/api/kanoon/fetch-single`        | Crawl one judgment by URL                    |
+| `GET`  | `/api/kanoon/stats`               | Indexed-case statistics                      |
+| `GET`  | `/api/kanoon/recommended-queries` | Suggested seed queries                       |
+
+Crawler behaviour is tuned via `KANOON_CRAWL_DELAY_MS`, `KANOON_MAX_RETRIES`,
+`KANOON_TIMEOUT_MS`, and `KANOON_USER_AGENT` (see `.env.example`). Please crawl
+responsibly and respect the source site's terms of use.
 

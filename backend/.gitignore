@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+
+# Runtime artifacts
+uploads/
+*.log
+logs/
+rag_output.txt
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -130,13 +130,15 @@ const searchKanoonCases = async (req, res) => {
       });
     }
 
-    const caseLinks = await kanoonService.searchCases(query, limit);
+    const result = await kanoonService.searchCases(query);
+    const docs = result.docs.slice(0, limit);
 
     res.status(200).json({
       success: true,
       query,
-      count: caseLinks.length,
-      cases: caseLinks
+      found: result.found,
+      count: docs.length,
+      cases: docs
     });
   } catch (error) {
     console.error('Kanoon search error:', error);

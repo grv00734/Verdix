@@ -5,7 +5,7 @@
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
-const auth = require('../middleware/auth');
+const { authMiddleware } = require('../middleware/auth');
 const {
   uploadDocument,
   getCaseDocuments,
@@ -18,7 +18,10 @@ const {
 const router = express.Router();
 
 // Configure multer for file uploads
+const fs = require('fs');
 const uploadDir = process.env.UPLOAD_DIR || './uploads';
+// Ensure the upload directory exists (multer.diskStorage will not create it).
+fs.mkdirSync(uploadDir, { recursive: true });
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, uploadDir);
@@ -56,41 +59,41 @@ const upload = multer({
  * Required: JWT token
  * Multipart form: file
  */
-router.post('/:caseId/upload', auth, upload.single('document'), uploadDocument);
+router.post('/:caseId/upload', authMiddleware, upload.single('document'), uploadDocument);
 
 /**
  * GET /api/documents/:caseId
  * Get all documents for a case
  * Required: JWT token
  */
-router.get('/:caseId', auth, getCaseDocuments);
+router.get('/:caseId', authMiddleware, getCaseDocuments);
 
 /**
  * GET /api/documents/:caseId/:docId/analysis
  * Get document analysis (extracted text, key information)
  * Required: JWT token
  */
-router.get('/:caseId/:docId/analysis', auth, getDocumentAnalysis);
+router.get('/:caseId/:docId/analysis', authMiddleware, getDocumentAnalysis);
 
 /**
  * GET /api/documents/:caseId/:docId/download
  * Download a document
  * Required: JWT token
  */
-router.get('/:caseId/:docId/download', auth, downloadDocument);
+router.get('/:caseId/:docId/download', authMiddleware, downloadDocument);
 
 /**
  * POST /api/documents/:caseId/:docId/rescan
  * Re-scan and re-analyze a document
  * Required: JWT token
  */
-router.post('/:caseId/:docId/rescan', auth, rescanDocument);
+router.post('/:caseId/:docId/rescan', authMiddleware, rescanDocument);
 
 /**
  * DELETE /api/documents/:caseId/:docId
  * Delete a document from a case
  * Required: JWT token
  */
-router.delete('/:caseId/:docId', auth, deleteDocument);
+router.delete('/:caseId/:docId', authMiddleware, deleteDocument);
 
 module.exports = router;

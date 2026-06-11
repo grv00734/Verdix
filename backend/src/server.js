@@ -3,15 +3,37 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const morgan = require('morgan');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const { getVectorStore } = require('./services/vectorStoreService');
 
 const app = express();
 
-// Middleware
-app.use(cors());
-app.use(morgan('dev'));
-app.use(express.json());
+// Security headers
+app.use(helmet());
+
+// CORS — restrict to configured origins when provided, else allow all (dev).
+const corsOrigins = process.env.CORS_ORIGIN
+  ? process.env.CORS_ORIGIN.split(',').map((o) => o.trim())
+  : '*';
+app.use(cors({ origin: corsOrigins }));
+
+// Logging & body parsing
+app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
+app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
+
+// Rate limiting to protect the API from abuse.
+app.use(
+  '/api',
+  rateLimit({
+    windowMs: Number(process.env.RATE_LIMIT_WINDOW_MS || 15 * 60 * 1000),
+    max: Number(process.env.RATE_LIMIT_MAX || 300),
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many requests, please try again later.' }
+  })
+);
 
 // Main async startup function
 const startServer = async () => {
@@ -46,20 +68,30 @@ const startServer = async () => {
     app.use('/api/lawyers', require('./routes/lawyerRoutes'));
     app.use('/api/subscription', require('./routes/subscriptionRoutes'));
     app.use('/api/kanoon', require('./routes/kanoonRoutes'));
+    app.use('/api/documents', require('./routes/documentRoutes'));
 
     // Health check
     app.get('/api/health', (req, res) => {
-      res.json({ status: 'Server is running', database: 'connected' });
+      res.json({
+        status: 'Server is running',
+        database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+        timestamp: new Date().toISOString()
+      });
     });
 
-    // Error handling middleware
+    // 404 for unknown API routes
+    app.use('/api', (req, res) => {
+      res.status(404).json({ error: `Route not found: ${req.method} ${req.originalUrl}` });
+    });
+
+    // Centralized error handler
     app.use((err, req, res, next) => {
       console.error(err);
-      res.status(500).json({ error: 'Internal server error' });
+      res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
     });
 
     // 5. Start the server (only after everything is ready)
-    const PORT = process.env.PORT || 5000;
+    const PORT = process.env.PORT || 5001;
     app.listen(PORT, () => {
       console.log(`✓ Server running on port ${PORT}`);
       console.log('✓ All systems ready');
